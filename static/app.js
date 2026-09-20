@@ -902,10 +902,12 @@ class App {
             }
             this.tableWrapper.style.display = 'block';
             this.gridWrapper.style.display = 'none';
+            this.gridContainer.innerHTML = '';
             this.renderTable(maps);
         } else {
             this.tableWrapper.style.display = 'none';
             this.gridWrapper.style.display = 'block';
+            this.tbody.innerHTML = '';
             this.renderGrid(maps);
         }
         
