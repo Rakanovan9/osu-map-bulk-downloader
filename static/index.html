@@ -224,6 +224,7 @@
             <div class="sidebar-section">
                 <div><strong>Selected:</strong> <span id="selected-count">0</span> maps</div>
                 <button id="download-btn" onclick="window.app.startDownloadQueue()" style="font-weight:bold; width:100%; margin-top:5px;" disabled>Start Download Queue</button>
+                <button id="cancel-queue-btn" onclick="window.app.cancelQueue()" style="display:none; color:white; background-color:#cc0000; font-weight:bold; width:100%; margin-top:5px;">Cancel Queue</button>
                 <button id="retry-failed-btn" onclick="window.app.retryAllFailed()" style="display:none; color:#cc0000; font-weight:bold; width:100%; margin-top:5px;">Retry Failed Downloads</button>
                 <button id="open-folder-btn" onclick="window.app.openFolder()" style="width:100%; margin-top:5px;">Open Songs Folder</button>
                 <button onclick="window.app.refreshDownloadedStatus()" style="width:100%; margin-top:5px;" title="Re-check your Songs folder for newly downloaded maps">↻ Refresh Downloaded Status</button>

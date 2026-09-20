@@ -18,15 +18,17 @@ class App {
         this.maps = []; // Store currently fetched maps
         this.mapsById = new Map();
         this.currentAudioId = null;
+        this.currentAudio = null;
         
         this.viewMode = 'table';
         
         // Pagination state
         this.currentCursor = null;
-        this.searchMode = 'mapper';
+        this.searchMode = 'mapper'; // 'mapper', 'global', 'topplays'
         
         // Search history
         this.searchHistory = JSON.parse(localStorage.getItem('searchHistory') || '[]');
+        this.cancelRequested = false;
         
         // Cache DOM
         this.tbody = document.getElementById('beatmap-tbody');
@@ -1218,6 +1220,7 @@ class App {
     async startDownloadQueue() {
         if (this.selectedIds.size === 0) return;
         this.downloadQueue = Array.from(this.selectedIds);
+        this.cancelRequested = false;
         
         // Initialize activeQueue
         this.activeQueue = this.downloadQueue.map(id => {
@@ -1229,12 +1232,16 @@ class App {
         this.updateSidebar();
         this.initQueueDOM();
         
+        document.getElementById('cancel-queue-btn').style.display = 'block';
+        
         this.logConsole(`Starting batch download of ${this.downloadQueue.length} maps...`, "info");
         
         let completed = 0;
         let total = this.downloadQueue.length;
         
         for (let i = 0; i < total; i++) {
+            if (this.cancelRequested) break;
+            
             const id = this.downloadQueue[i];
             document.getElementById('batch-count').textContent = `${i+1}/${total}`;
             const fill = document.getElementById('batch-prog-fill');
@@ -1247,22 +1254,46 @@ class App {
         }
         
         this.isDownloading = false;
+        document.getElementById('cancel-queue-btn').style.display = 'none';
+        
         this.selectedIds.clear();
         this.render(); 
         this.updateSidebar();
         
         const successCount = completed - this.failedIds.size;
         const failCount = this.failedIds.size;
-        this.logConsole(`Batch queue finished. Downloaded ${successCount} items. ${failCount} failed.`, "ok");
         
-        // Desktop notification
-        this.showToast(`Queue complete! ${successCount} downloaded, ${failCount} failed.`, failCount > 0 ? 'warn' : 'ok');
-        if ('Notification' in window && Notification.permission === 'granted') {
-            new Notification('osu! Downloader — Queue Complete', {
-                body: `${successCount} maps downloaded. ${failCount} failed.`,
-            });
-        } else if ('Notification' in window && Notification.permission !== 'denied') {
-            Notification.requestPermission();
+        if (this.cancelRequested) {
+            this.logConsole(`Batch queue cancelled. Downloaded ${successCount} items. ${failCount} failed.`, "warn");
+            this.showToast(`Queue cancelled! ${successCount} downloaded.`, 'warn');
+        } else {
+            this.logConsole(`Batch queue finished. Downloaded ${successCount} items. ${failCount} failed.`, "ok");
+            
+            // Desktop notification
+            this.showToast(`Queue complete! ${successCount} downloaded, ${failCount} failed.`, failCount > 0 ? 'warn' : 'ok');
+            if ('Notification' in window && Notification.permission === 'granted') {
+                new Notification('osu! Downloader — Queue Complete', {
+                    body: `${successCount} maps downloaded. ${failCount} failed.`,
+                });
+            } else if ('Notification' in window && Notification.permission !== 'denied') {
+                Notification.requestPermission();
+            }
+        }
+    }
+    
+    cancelQueue() {
+        if (!this.isDownloading) return;
+        this.cancelRequested = true;
+        this.logConsole("Cancelling download queue...", "warn");
+        
+        // Abort the active download immediately
+        if (this.activeEventSource) {
+            this.activeEventSource.close();
+            this.activeEventSource = null;
+        }
+        if (this.activeResolve) {
+            this.activeResolve();
+            this.activeResolve = null;
         }
     }
     
@@ -1279,6 +1310,21 @@ class App {
             
             this.failedIds.delete(id);
             const ev = new EventSource(`/api/download-progress/${id}`);
+            this.activeEventSource = ev;
+            
+            // If the user hits cancel, we resolve early from outside this block, but we need
+            // to wrap the normal completion to also clear activeEventSource/activeResolve.
+            const wrapResolve = () => {
+                this.activeEventSource = null;
+                this.activeResolve = null;
+                resolve();
+            };
+            this.activeResolve = () => {
+                qItem.status = 'cancelled';
+                this.updateQueueItemDOM(id, qItem.status, 0);
+                this.updateActCell(id, `<span style="color:#cc0000;font-weight:bold;">Cancelled</span>`);
+                wrapResolve();
+            };
             
             ev.onmessage = (e) => {
                 const data = JSON.parse(e.data);
@@ -1317,7 +1363,7 @@ class App {
                     this.updateActCell(id, `<span style="color:#009900;font-weight:bold;">Done</span>`);
                     this.downloadedIds.add(id);
                     this.logConsole(`Successfully downloaded ${data.filename} to Songs folder.`, "ok");
-                    resolve();
+                    wrapResolve();
                 }
                 else if (data.type === 'failed') {
                     ev.close();
@@ -1327,7 +1373,7 @@ class App {
                     this.updateActCell(id, `<span style="color:#990000;font-weight:bold;">Failed</span>`);
                     if(tr) tr.classList.add('failed');
                     this.failedIds.add(id);
-                    resolve();
+                    wrapResolve();
                 }
             };
             
@@ -1341,7 +1387,7 @@ class App {
                 if(tr) tr.classList.add('failed');
                 this.failedIds.add(id);
                 this.logConsole(`Connection interrupted for map ${id}.`, "err");
-                resolve();
+                wrapResolve();
             };
         });
     }

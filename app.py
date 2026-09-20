@@ -36,9 +36,12 @@ OSU_API_BASE  = "https://osu.ppy.sh/api/v2"
 OSU_TOKEN_URL = "https://osu.ppy.sh/oauth/token"
 
 MIRRORS = [
-    {"name": "Nerinyan",   "url": "https://api.nerinyan.moe/d/{id}"},
-    {"name": "osu.direct", "url": "https://osu.direct/api/d/{id}"},
-    {"name": "catboy.best","url": "https://catboy.best/d/{id}"},
+    {"name": "BeatConnect", "url": "https://beatconnect.io/b/{id}"},
+    {"name": "Nekoha",      "url": "https://mirror.nekoha.moe/d/{id}"},
+    {"name": "Sayobot",     "url": "https://dl.sayobot.cn/beatmaps/download/full/{id}"},
+    {"name": "Nerinyan",    "url": "https://api.nerinyan.moe/d/{id}"},
+    {"name": "osu.direct",  "url": "https://osu.direct/api/d/{id}"},
+    {"name": "catboy.best", "url": "https://catboy.best/d/{id}"},
 ]
 
 _ID_RE     = re.compile(r'^(\d+)')
