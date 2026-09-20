@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>osu! Mapper Downloader (Classic)</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Image Tooltip -->
+    <div id="img-tooltip" class="img-tooltip">
+        <img id="img-tooltip-src" src="" alt="preview">
+    </div>
+
+    <div class="header-bar">
+        <h1>osu! Mapper Bulk Downloader</h1>
+        <p>Database and Download Utility</p>
+        <div class="header-nav">
+            <span id="songs-path-display" style="font-size:11px; color:#ccc; margin-right:10px;"></span>
+            <a href="#" onclick="window.app.toggleDarkMode()">[ Toggle Dark Mode ]</a>
+            &nbsp;&nbsp;
+            <a href="/setup?edit=true">[ Settings ]</a>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+        <div class="tab-btn active" onclick="window.app.switchTab('browser')">Beatmap Browser</div>
+        <div class="tab-btn" onclick="window.app.switchTab('history')">Download History</div>
+        <div class="tab-btn" onclick="window.app.switchTab('log')">System Log</div>
+    </div>
+
+    <div class="main-layout">
+        <!-- LEFT COLUMN (Main Content) -->
+        <div class="main-content">
+            <!-- TAB: BROWSER -->
+            <div id="tab-browser" class="tab-content active">
+                <!-- Search Form -->
+                <div class="search-container">
+                    <div class="search-toggle">
+                        <label title="Search by mapper username — loads all beatmaps created by that mapper"><input type="radio" name="search-mode" value="mapper" checked onchange="window.app.toggleSearchMode()"> Mapper Search</label>
+                        <label style="margin-left:15px;" title="Search the osu! beatmap database by title, artist, or tags — supports mode/status/sort filters"><input type="radio" name="search-mode" value="global" onchange="window.app.toggleSearchMode()"> Global Search</label>
+                        <label style="margin-left:15px;" title="Enter a player's username — loads their top 100 plays and lets you bulk-download the mapsets"><input type="radio" name="search-mode" value="topplays" onchange="window.app.toggleSearchMode()"> Top Plays</label>
+                    </div>
+                    <form id="search-form" onsubmit="event.preventDefault(); window.app.performSearch();">
+                        <input type="text" id="search-query" class="search-input" placeholder="Search mapper (e.g. Sotarks)..." autocomplete="off" required>
+                        <button type="button" onclick="window.app.clearSearch()" title="Clear search" style="background:none; border:1px solid #999; cursor:pointer; padding:2px 7px; font-size:14px; vertical-align:middle;">&times;</button>
+                        <button type="submit" id="search-btn" class="search-btn">Search &raquo;</button>
+                    </form>
+                    <div id="search-history" style="min-height:18px; margin-top:4px;"></div>
+                    <div id="global-filters" style="display:none; margin-top:8px; border-top:1px solid #bbb; padding-top:8px;">
+                        <strong>Global Search Filters</strong><br>
+                        <label>Mode <select id="global-mode"><option value="">All</option><option value="osu">osu!</option><option value="taiko">Taiko</option><option value="fruits">Catch</option><option value="mania">Mania</option></select></label>
+                        <label style="margin-left:8px;">Status <select id="global-status"><option value="">Any</option><option value="ranked">Ranked</option><option value="qualified">Qualified</option><option value="loved">Loved</option><option value="pending">Pending</option><option value="graveyard">Graveyard</option></select></label>
+                        <label style="margin-left:8px;">Sort <select id="global-sort"><option value="">Relevance</option><option value="ranked">Newest Ranked</option><option value="favourites">Most Favourited</option><option value="plays">Most Played</option><option value="rating">Rating</option><option value="title">Title</option></select></label>
+                        <button type="button" onclick="window.app.resetGlobalFilters()" style="margin-left:8px;">Reset Filters</button>
+                    </div>
+                    <div id="topplay-filters" style="display:none; margin-top:8px; border-top:1px solid #bbb; padding-top:8px;">
+                        <strong>Top Plays Options</strong><br>
+                        <label>Game Mode <select id="topplay-mode"><option value="">Player Default</option><option value="osu">osu!</option><option value="taiko">Taiko</option><option value="fruits">Catch</option><option value="mania">Mania</option></select></label>
+                    </div>
+                </div>
+
+                <!-- Mapper Info -->
+                <div id="mapper-info" class="mapper-info">
+                    <table width="100%">
+                        <tr>
+                            <td width="100">
+                                <img id="mapper-avatar" src="" width="80" height="80" alt="Avatar" style="border: 1px solid #000;">
+                            </td>
+                            <td width="200">
+                                <h2 style="margin: 0 0 5px 0;"><a id="mapper-profile-link" href="#" target="_blank"><span id="mapper-name"></span></a></h2>
+                                <div style="font-size: 12px;">
+                                    Global Rank: <span id="mapper-rank"></span><br>
+                                    Play Count: <span id="mapper-playcount"></span><br>
+                                    Country: <span id="mapper-country"></span>
+                                </div>
+                            </td>
+                            <td valign="top" style="border-left: 1px solid #ccc; padding-left: 15px;">
+                                <strong>Beatmap Stats</strong>
+                                <div style="font-size: 12px; margin-top: 5px;">
+                                    Total Available: <span id="stat-total">0</span><br>
+                                    Downloaded: <span id="stat-downloaded">0</span><br>
+                                    Modes: <span id="stat-modes">-</span>
+                                </div>
+                            </td>
+                            <td valign="top" align="right" style="border-left: 1px solid #ccc; padding-left: 15px;">
+                                <strong>Quick Actions</strong>
+                                <div style="margin-top: 5px;">
+                                    <button onclick="window.app.selectAllUndownloaded()" style="width: 150px; margin-bottom: 2px;">Select Visible Not Downloaded</button><br>
+                                    <button onclick="window.app.selectAll()" style="width: 150px; margin-bottom: 2px;">Select Visible</button><br>
+                                    <button onclick="window.app.selectNone()" style="width: 150px;">Clear Selection</button>
+                                </div>
+                                <div id="topplay-quick-actions" style="display:none; margin-top:5px; border-top:1px solid #ccc; padding-top:5px;">
+                                    <button onclick="window.app.selectTopN(10)" style="width:72px; margin-bottom:2px;">Top 10</button>
+                                    <button onclick="window.app.selectTopN(25)" style="width:72px; margin-bottom:2px;">Top 25</button>
+                                </div>
+                            </td>
+                        </tr>
+                    </table>
+                </div>
+
+                <!-- Controls -->
+                <div id="controls" class="controls">
+                    <table width="100%">
+                        <tr>
+                            <td valign="top">
+                                <label for="text-filter">Filter Loaded Results:</label><br>
+                                <input type="text" id="text-filter" size="20" placeholder="Title, artist, tags..." oninput="window.app.applyFilters()">
+                            </td>
+
+                            <td valign="top">
+                                <label for="sort-select">Sort by:</label><br>
+                                <select id="sort-select" onchange="window.app.applyFilters()">
+                                    <option value="date-desc">Date (Newest)</option>
+                                    <option value="date-asc">Date (Oldest)</option>
+                                    <option value="stars-desc">Stars (Highest)</option>
+                                    <option value="stars-asc">Stars (Lowest)</option>
+                                    <option value="bpm-desc">BPM (Fastest)</option>
+                                    <option value="bpm-asc">BPM (Slowest)</option>
+                                    <option value="title-asc">Title (A-Z)</option>
+                                    <option value="title-desc">Title (Z-A)</option>
+                                    <option value="favs-desc">Most Favourited</option>
+                                    <option value="pp-desc">PP (Highest)</option>
+                                    <option value="pp-asc">PP (Lowest)</option>
+                                    <option value="acc-desc">Accuracy (Best)</option>
+                                    <option value="acc-asc">Accuracy (Worst)</option>
+                                    <option value="misses-asc">Misses (Fewest)</option>
+                                    <option value="misses-desc">Misses (Most)</option>
+                                    <option value="rank-asc">Top Play Rank</option>
+                                </select>
+                            </td>
+                            <td valign="top">
+                                <fieldset style="margin:0; padding:2px 5px;">
+                                    <legend style="font-size:10px;">View Mode</legend>
+                                    <label><input type="radio" name="view-mode" value="table" onchange="window.app.toggleViewMode()" checked> Details Table</label><br>
+                                    <label><input type="radio" name="view-mode" value="grid" onchange="window.app.toggleViewMode()"> Thumbnail Grid</label>
+                                </fieldset>
+                            </td>
+                            <td valign="top">
+                                <label>Vol: <br><input type="range" id="preview-volume" min="0" max="1" step="0.05" value="0.3" oninput="window.app.updateVolume()" style="width:60px; vertical-align:middle;"></label>
+                            </td>
+                            <td align="right" valign="top">
+                                <label>
+                                    <input type="checkbox" id="show-downloaded" checked onchange="window.app.applyFilters()">
+                                    Show Already Downloaded
+                                </label>
+                            </td>
+                        </tr>
+                    </table>
+                </div>
+
+                <div id="loading" class="loading-msg">Searching database. Please wait...</div>
+                <div id="empty-state" class="empty-msg">No beatmaps found for this user.</div>
+
+                <div id="result-counter" style="display:none; font-size:11px; color:#777; padding:4px 6px; background:#f0f0f0; border:1px solid #ddd; margin-bottom:4px;"></div>
+
+                <!-- Data Table -->
+                <div id="beatmap-table-wrapper" style="display: none;">
+                    <table id="beatmap-table" class="data-table">
+                        <thead>
+                            <tr>
+                                <th width="30" style="text-align:center;">Sel</th>
+                                <th width="60">ID</th>
+                                <th width="70">Status</th>
+                                <th>Artist - Title</th>
+                                <th width="60">Mode</th>
+                                <th id="header-stars" width="80">Stars</th>
+                                <th id="header-bpm" width="80">BPM</th>
+                                <th width="90">Date</th>
+                                <th width="70">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="beatmap-tbody">
+                            <!-- Rows injected here -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Thumbnail Grid -->
+                <div id="beatmap-grid-wrapper" style="display: none;">
+                    <div id="beatmap-grid" class="thumbnail-grid">
+                        <!-- Grid cells injected here -->
+                    </div>
+                <!-- Pagination (Global Search) -->
+                <div id="pagination-controls" style="display: none; text-align: center; margin-top: 10px; margin-bottom: 10px;">
+                    <button id="load-more-btn" onclick="window.app.loadMore()" style="width:200px; padding:8px; font-weight:bold;">Load More Results...</button>
+                </div>
+            </div>
+            </div>
+
+            <!-- TAB: HISTORY -->
+            <div id="tab-history" class="tab-content">
+                <h2>Download History</h2>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th width="150">Date</th>
+                            <th width="80">Map ID</th>
+                            <th>Filename</th>
+                            <th width="100">Mirror</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-tbody">
+                        <tr><td colspan="4">Loading history...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- TAB: LOG -->
+            <div id="tab-log" class="tab-content">
+                <h2>Download & System Log</h2>
+                <div class="console-log-page">
+                    <ul id="console-log"></ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- RIGHT COLUMN (Sidebar / Download Manager) -->
+        <div class="sidebar">
+            <div class="sidebar-header">Download Manager</div>
+            
+            <div class="sidebar-section">
+                <div><strong>Selected:</strong> <span id="selected-count">0</span> maps</div>
+                <button id="download-btn" onclick="window.app.startDownloadQueue()" style="font-weight:bold; width:100%; margin-top:5px;" disabled>Start Download Queue</button>
+                <button id="retry-failed-btn" onclick="window.app.retryAllFailed()" style="display:none; color:#cc0000; font-weight:bold; width:100%; margin-top:5px;">Retry Failed Downloads</button>
+                <button id="open-folder-btn" onclick="window.app.openFolder()" style="width:100%; margin-top:5px;">Open Songs Folder</button>
+                <button onclick="window.app.refreshDownloadedStatus()" style="width:100%; margin-top:5px;" title="Re-check your Songs folder for newly downloaded maps">↻ Refresh Downloaded Status</button>
+            </div>
+            
+            <div id="batch-progress-panel" class="sidebar-section" style="display:none;">
+                <div style="font-weight:bold; margin-bottom:5px;">Batch Progress</div>
+                <div>Queue: <span id="batch-count">0/0</span></div>
+                <div>Speed: <span id="batch-speed">0 MB/s</span></div>
+                <div>ETA: <span id="batch-eta">...</span></div>
+                <div class="prog-container" style="width:100%; margin-top:5px;">
+                    <div class="prog-fill" id="batch-prog-fill"></div>
+                </div>
+            </div>
+
+            <div class="sidebar-header" style="margin-top:10px;">Queue Activity</div>
+            <div class="queue-list" id="queue-list">
+                <!-- Queue items injected here -->
+                <div style="color:#999; font-style:italic; padding:10px; text-align:center;">Queue is empty</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Audio Player -->
+    <audio id="preview-audio" style="display:none;" preload="none"></audio>
+    
+    <script src="app.js"></script>
+</body>
+</html>

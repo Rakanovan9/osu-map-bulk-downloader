@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+venv/
+.venv/
+build/
+dist/
+
+# Application Data
+config.json
+history.json
+
+# PyInstaller files
+*.spec
