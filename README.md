@@ -1,4 +1,4 @@
-# osu! Mapper Bulk Downloader
+# osu! Map Bulk Downloader
 
 A lightweight, local desktop application built with Python (Flask/pywebview) designed for osu! players who want a streamlined way to discover and bulk-download beatmaps. 
 

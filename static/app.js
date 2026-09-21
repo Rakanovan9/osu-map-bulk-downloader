@@ -1,8 +1,10 @@
-// osu! Mapper Downloader - Classic Web 1.0 logic
+// osu! Mapper Downloader - Classic Web 1.0 logic (v1.2)
 
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, char => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
 })[char]);
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 class App {
     constructor() {
@@ -29,6 +31,16 @@ class App {
         // Search history
         this.searchHistory = JSON.parse(localStorage.getItem('searchHistory') || '[]');
         this.cancelRequested = false;
+
+        // v1.2: config, parallel, speed buffer, mirror health
+        this.config = { max_parallel: 2, download_delay_ms: 500, version: '1.2.1' };
+        this.activeEventSources = new Map(); // id -> EventSource (for parallel slots)
+        this.activeResolves = new Map();     // id -> resolve fn
+        this.currentDownloadingIds = new Set(); // IDs currently being downloaded
+        this.speedSamples = [];              // rolling average ring buffer
+        this.mirrorFailCounts = {};           // mirror-name -> consecutive fail count
+        this.lastClickedIndex = -1;          // for shift+click range selection
+        this.activeSpeeds = new Map();       // id -> current speed in bps
         
         // Cache DOM
         this.tbody = document.getElementById('beatmap-tbody');
@@ -120,6 +132,24 @@ class App {
                 this.tooltip.style.top = (e.clientY + 15) + 'px';
             }
         });
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.target.matches('input, select, textarea')) return;
+            if (e.key === 'Escape' && !this.isDownloading) this.selectNone();
+            if (e.key === 'Enter' && !this.isDownloading && this.selectedIds.size > 0) {
+                e.preventDefault();
+                this.startDownloadQueue();
+            }
+        });
+
+        // Quick Add: Enter key in quick-add input
+        const quickAddInput = document.getElementById('quick-add-input');
+        if (quickAddInput) {
+            quickAddInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); this.quickAddMap(); }
+            });
+        }
         
         // Load Dark Mode pref
         if (localStorage.getItem('darkMode') === '1') {
@@ -127,7 +157,43 @@ class App {
         }
         
         this.loadConfig();
+        this.fetchStats();
+        setInterval(() => this.fetchStats(), 5000);
         this.renderSearchHistory();
+    }
+    
+    async fetchStats() {
+        try {
+            const r = await fetch('/api/stats');
+            const data = await r.json();
+            const el = document.getElementById('session-stats');
+            if (el) {
+                const mb = (data.bytes / (1024 * 1024)).toFixed(1);
+                el.textContent = `Session: ${data.maps} maps (${mb} MB)`;
+            }
+        } catch (e) {
+            // ignore
+        }
+    }
+    
+    openSettingsModal() {
+        const modal = document.getElementById('settings-modal');
+        const iframe = document.getElementById('settings-iframe');
+        if (modal && iframe) {
+            iframe.src = '/setup?edit=true&modal=true';
+            modal.classList.add('active');
+        }
+    }
+    
+    closeSettingsModal() {
+        const modal = document.getElementById('settings-modal');
+        const iframe = document.getElementById('settings-iframe');
+        if (modal && iframe) {
+            modal.classList.remove('active');
+            iframe.src = '';
+            // Refresh config in case settings were changed
+            this.loadConfig();
+        }
     }
     
     toggleDarkMode() {
@@ -190,11 +256,22 @@ class App {
         try {
             const r = await fetch('/api/config');
             const data = await r.json();
+            // Store full config for download manager
+            this.config = {
+                max_parallel: data.max_parallel || 2,
+                download_delay_ms: data.download_delay_ms || 500,
+                version: data.version || '1.2.1',
+            };
             const display = document.getElementById('songs-path-display');
             display.replaceChildren('Songs folder: ');
             const path = document.createElement('code');
             path.textContent = data.songs_path || '';
             display.appendChild(path);
+            // Update version badge
+            const vBadge = document.getElementById('version-badge');
+            if (vBadge) vBadge.textContent = `v${this.config.version} · osu! Map Bulk Downloader`;
+            const headerV = document.getElementById('header-version');
+            if (headerV) headerV.textContent = `v${this.config.version}`;
         } catch (e) {
             this.logConsole("Error loading config", "err");
         }
@@ -337,7 +414,7 @@ class App {
         
         this.searchHistory.slice(0, 6).forEach(h => {
             const chip = document.createElement('span');
-            const modeLabel = h.mode === 'global' ? '🔍' : h.mode === 'topplays' ? '🏆' : '🗺️';
+            const modeLabel = h.mode === 'global' ? 'Global:' : h.mode === 'topplays' ? 'Top:' : 'Mapper:';
             chip.textContent = `${modeLabel} ${h.query}`;
             chip.title = `${h.mode}: ${h.query}`;
             chip.style.cssText = 'display:inline-block; background:#e0e0e0; border:1px solid #bbb; padding:1px 6px; margin:2px 3px; font-size:11px; cursor:pointer; border-radius:2px;';
@@ -365,6 +442,85 @@ class App {
     clearSearch() {
         this.searchInput.value = '';
         this.searchInput.focus();
+    }
+
+    quickAddMap() {
+        const input = document.getElementById('quick-add-input');
+        if (!input) return;
+        const raw = input.value.trim();
+        if (!raw) return;
+        // Extract beatmapset ID from URL or bare number
+        const urlMatch = raw.match(/beatmapsets\/(\d+)/);
+        const idMatch = raw.match(/^(\d+)$/);
+        const id = urlMatch ? parseInt(urlMatch[1]) : idMatch ? parseInt(idMatch[1]) : null;
+        if (!id || isNaN(id)) {
+            this.showToast('Invalid ID or URL. Use a beatmapset ID or osu.ppy.sh URL.', 'err');
+            return;
+        }
+        if (this.downloadedIds.has(id)) {
+            this.showToast(`Map ${id} is already downloaded.`, 'warn');
+            input.value = '';
+            return;
+        }
+        if (this.selectedIds.has(id)) {
+            this.showToast(`Map ${id} is already in the selection.`, 'warn');
+            input.value = '';
+            return;
+        }
+        this.selectedIds.add(id);
+        // Add a placeholder map entry if we don't have it
+        if (!this.mapsById.has(id)) {
+            const placeholder = { id, title: `Beatmap #${id}`, artist: '', _type: 'unknown', _modes: [], _maxStars: 0, _bpm: 0, _searchTitle: '' };
+            this.mapsById.set(id, placeholder);
+        }
+        input.value = '';
+        this.renderSelectedList();
+        this.updateSidebar();
+        this.logConsole(`Added map ${id} to selection via Quick Add.`, 'ok');
+    }
+
+    renderSelectedList() {
+        const container = document.getElementById('selected-list');
+        if (!container) return;
+        container.innerHTML = '';
+
+        if (this.selectedIds.size === 0) {
+            container.innerHTML = '<div class="selected-list-empty">No maps selected</div>';
+            return;
+        }
+
+        const df = document.createDocumentFragment();
+        for (const id of this.selectedIds) {
+            const map = this.mapsById.get(id);
+            const title = map ? `${map.artist ? map.artist + ' - ' : ''}${map.title}` : `Beatmap #${id}`;
+
+            const item = document.createElement('div');
+            item.className = 'selected-list-item';
+
+            const btn = document.createElement('button');
+            btn.className = 'dequeue-btn';
+            btn.innerHTML = '&times;';
+            btn.title = `Remove ${id} from selection`;
+            btn.addEventListener('click', () => {
+                this.toggleSelection(id, false);
+                this.renderSelectedList();
+            });
+
+            const idSpan = document.createElement('span');
+            idSpan.style.cssText = 'color:#666; margin-right:4px; flex-shrink:0; font-size:10px;';
+            idSpan.textContent = id;
+
+            const titleSpan = document.createElement('span');
+            titleSpan.className = 'sel-title';
+            titleSpan.textContent = title;
+            titleSpan.title = title;
+
+            item.appendChild(btn);
+            item.appendChild(idSpan);
+            item.appendChild(titleSpan);
+            df.appendChild(item);
+        }
+        container.appendChild(df);
     }
     
     async refreshDownloadedStatus() {
@@ -924,8 +1080,9 @@ class App {
         }
         
         const df = document.createDocumentFragment();
+        this._lastFilteredMaps = maps; // store for shift-click range
         
-        maps.forEach(s => {
+        maps.forEach((s, mapIndex) => {
             const tr = document.createElement('tr');
             const topPlay = s._top_play;
             const isDl = this.downloadedIds.has(s.id);
@@ -937,6 +1094,28 @@ class App {
             if (isFail) tr.classList.add('failed');
             
             tr.id = `row-${s.id}`;
+            
+            // Row click-to-toggle (exclude links, play button, action cell)
+            tr.addEventListener('click', (e) => {
+                if (e.target.closest('a, .play-btn, input[type="checkbox"], button')) return;
+                if (isDl) return;
+                const newState = !this.selectedIds.has(s.id);
+
+                if (e.shiftKey && this.lastClickedIndex >= 0 && this._lastFilteredMaps) {
+                    // Shift+click: range selection
+                    const start = Math.min(this.lastClickedIndex, mapIndex);
+                    const end = Math.max(this.lastClickedIndex, mapIndex);
+                    for (let i = start; i <= end; i++) {
+                        const rangeMap = this._lastFilteredMaps[i];
+                        if (rangeMap && !this.downloadedIds.has(rangeMap.id)) {
+                            this.toggleSelection(rangeMap.id, newState);
+                        }
+                    }
+                } else {
+                    this.toggleSelection(s.id, newState);
+                }
+                this.lastClickedIndex = mapIndex;
+            });
             
             const tdCb = document.createElement('td');
             tdCb.align = 'center';
@@ -1136,6 +1315,8 @@ class App {
             btn.textContent = `Start Queue (${count})`;
             progPanel.style.display = 'none';
         }
+
+        this.renderSelectedList();
     }
     
     updateActCell(id, html) {
@@ -1221,11 +1402,14 @@ class App {
         if (this.selectedIds.size === 0) return;
         this.downloadQueue = Array.from(this.selectedIds);
         this.cancelRequested = false;
+        this.speedSamples = [];
+        this.mirrorFailCounts = {};
+        this._completedCount = 0;
         
         // Initialize activeQueue
         this.activeQueue = this.downloadQueue.map(id => {
             const map = this.mapsById.get(id);
-            return { id: id, status: 'pending', percent: 0, text: map ? map.title : 'Beatmap' };
+            return { id: id, status: 'pending', percent: 0, text: map ? map.title : 'Beatmap', mirrorErrors: [] };
         });
         
         this.isDownloading = true;
@@ -1234,34 +1418,33 @@ class App {
         
         document.getElementById('cancel-queue-btn').style.display = 'block';
         
-        this.logConsole(`Starting batch download of ${this.downloadQueue.length} maps...`, "info");
+        const total = this.downloadQueue.length;
+        const slotCount = Math.min(this.config.max_parallel || 2, total);
+        this.logConsole(`Starting batch download of ${total} maps (${slotCount} parallel slots)...`, "info");
         
-        let completed = 0;
-        let total = this.downloadQueue.length;
-        
-        for (let i = 0; i < total; i++) {
-            if (this.cancelRequested) break;
-            
-            const id = this.downloadQueue[i];
-            document.getElementById('batch-count').textContent = `${i+1}/${total}`;
-            const fill = document.getElementById('batch-prog-fill');
-            if(fill) fill.style.width = `${((i)/total)*100}%`;
-
-            await this.downloadSingle(id, i);
-            completed++;
-            
-            if(fill) fill.style.width = `${((i+1)/total)*100}%`;
+        // Parallel slot runner
+        const queue = [...this.downloadQueue];
+        const workers = [];
+        for (let s = 0; s < slotCount; s++) {
+            workers.push(this._slotWorker(queue, total));
         }
+        await Promise.all(workers);
         
         this.isDownloading = false;
         document.getElementById('cancel-queue-btn').style.display = 'none';
         
-        this.selectedIds.clear();
+        // Instead of clearing all selections, only remove successfully downloaded maps
+        for (const id of Array.from(this.selectedIds)) {
+            if (this.downloadedIds.has(id)) {
+                this.selectedIds.delete(id);
+            }
+        }
+        
         this.render(); 
         this.updateSidebar();
         
-        const successCount = completed - this.failedIds.size;
         const failCount = this.failedIds.size;
+        const successCount = this._completedCount - failCount;
         
         if (this.cancelRequested) {
             this.logConsole(`Batch queue cancelled. Downloaded ${successCount} items. ${failCount} failed.`, "warn");
@@ -1272,11 +1455,35 @@ class App {
             // Desktop notification
             this.showToast(`Queue complete! ${successCount} downloaded, ${failCount} failed.`, failCount > 0 ? 'warn' : 'ok');
             if ('Notification' in window && Notification.permission === 'granted') {
-                new Notification('osu! Downloader — Queue Complete', {
+                new Notification('osu! Map Bulk Downloader — Queue Complete', {
                     body: `${successCount} maps downloaded. ${failCount} failed.`,
                 });
             } else if ('Notification' in window && Notification.permission !== 'denied') {
                 Notification.requestPermission();
+            }
+        }
+        
+        this.fetchStats();
+    }
+
+    async _slotWorker(queue, total) {
+        while (queue.length > 0 && !this.cancelRequested) {
+            const id = queue.shift();
+            const qIndex = this.downloadQueue.indexOf(id);
+            
+            this._completedCount++;
+            document.getElementById('batch-count').textContent = `${this._completedCount}/${total}`;
+            const fill = document.getElementById('batch-prog-fill');
+            if (fill) fill.style.width = `${((this._completedCount - 1) / total) * 100}%`;
+
+            await this.downloadSingle(id, qIndex);
+            
+            if (fill) fill.style.width = `${(this._completedCount / total) * 100}%`;
+
+            // Inter-download delay
+            if (queue.length > 0 && !this.cancelRequested) {
+                const delay = this.config.download_delay_ms || 500;
+                if (delay > 0) await sleep(delay);
             }
         }
     }
@@ -1286,14 +1493,48 @@ class App {
         this.cancelRequested = true;
         this.logConsole("Cancelling download queue...", "warn");
         
-        // Abort the active download immediately
-        if (this.activeEventSource) {
-            this.activeEventSource.close();
-            this.activeEventSource = null;
+        // Abort all active downloads immediately
+        for (const [id, es] of this.activeEventSources) {
+            es.close();
         }
-        if (this.activeResolve) {
-            this.activeResolve();
-            this.activeResolve = null;
+        this.activeEventSources.clear();
+        
+        for (const [id, resolveFn] of this.activeResolves) {
+            resolveFn();
+        }
+        this.activeResolves.clear();
+        this.currentDownloadingIds.clear();
+    }
+
+    skipCurrent() {
+        if (!this.isDownloading) return;
+        // Skip all currently downloading maps
+        for (const id of this.currentDownloadingIds) {
+            this.logConsole(`Skipping map ${id}...`, "warn");
+            // Signal the backend to abort gracefully
+            fetch(`/api/skip/${id}`, { method: 'POST' }).catch(() => {});
+            // Close the EventSource on the client side
+            const es = this.activeEventSources.get(id);
+            if (es) { es.close(); this.activeEventSources.delete(id); }
+            const resolveFn = this.activeResolves.get(id);
+            if (resolveFn) { resolveFn(); this.activeResolves.delete(id); }
+            this.currentDownloadingIds.delete(id);
+
+            const qItem = this.activeQueue.find(q => q.id === id);
+            if (qItem) {
+                qItem.status = 'skipped';
+                this.updateQueueItemDOM(id, 'skipped', 0);
+            }
+            this.updateActCell(id, `<span style="color:#e6a817;font-weight:bold;">Skipped</span>`);
+        }
+    }
+    
+    _updateGlobalSpeed() {
+        const totalSpeed = Array.from(this.activeSpeeds.values()).reduce((a, b) => a + b, 0);
+        const mbps = (totalSpeed / (1024 * 1024)).toFixed(1);
+        const batchSpeedEl = document.getElementById('batch-speed');
+        if (batchSpeedEl) {
+            batchSpeedEl.textContent = `${mbps} MB/s`;
         }
     }
     
@@ -1301,6 +1542,7 @@ class App {
         return new Promise(resolve => {
             const qItem = this.activeQueue[qIndex];
             qItem.status = 'trying...';
+            qItem.mirrorErrors = [];
             this.updateQueueItemDOM(id, qItem.status, 0);
 
             this.updateActCell(id, `<span style="font-weight:bold;">Downloading...</span>`);
@@ -1309,22 +1551,27 @@ class App {
             if(tr) tr.classList.remove('failed', 'selected');
             
             this.failedIds.delete(id);
+            this.currentDownloadingIds.add(id);
             const ev = new EventSource(`/api/download-progress/${id}`);
-            this.activeEventSource = ev;
+            this.activeEventSources.set(id, ev);
             
-            // If the user hits cancel, we resolve early from outside this block, but we need
-            // to wrap the normal completion to also clear activeEventSource/activeResolve.
             const wrapResolve = () => {
-                this.activeEventSource = null;
-                this.activeResolve = null;
+                this.activeEventSources.delete(id);
+                this.activeResolves.delete(id);
+                this.currentDownloadingIds.delete(id);
+                this.activeSpeeds.delete(id);
+                this._updateGlobalSpeed();
                 resolve();
             };
-            this.activeResolve = () => {
+            this.activeResolves.set(id, () => {
                 qItem.status = 'cancelled';
                 this.updateQueueItemDOM(id, qItem.status, 0);
                 this.updateActCell(id, `<span style="color:#cc0000;font-weight:bold;">Cancelled</span>`);
                 wrapResolve();
-            };
+            });
+            
+            // Rolling speed tracker for this download
+            const speedBuffer = [];
             
             ev.onmessage = (e) => {
                 const data = JSON.parse(e.data);
@@ -1334,25 +1581,56 @@ class App {
                     this.updateQueueItemDOM(id, qItem.status, 0);
                 }
                 else if (data.type === 'mirror_fail') {
+                    qItem.mirrorErrors.push({ mirror: data.mirror, reason: data.reason });
                     this.logConsole(`Map ${id} failed on ${data.mirror}: ${data.reason}`, "warn");
+                    this._updateQueueMirrorErrors(id, qItem.mirrorErrors);
+                    
+                    // Track consecutive mirror failures for notification
+                    this.mirrorFailCounts[data.mirror] = (this.mirrorFailCounts[data.mirror] || 0) + 1;
+                    if (this.mirrorFailCounts[data.mirror] === 3) {
+                        this._notifyMirrorDown(data.mirror);
+                    }
                 }
                 else if (data.type === 'start') {
                     this.logConsole(`Started downloading ${data.filename}...`, "info");
+                    // Reset consecutive fail count for this mirror since it's responding
+                    if (data.mirror) this.mirrorFailCounts[data.mirror] = 0;
                 }
                 else if (data.type === 'progress') {
-                    qItem.status = `[${data.mirror}] ${data.percent}%`;
+                    // Rolling average speed (5 samples)
+                    speedBuffer.push(data.speed);
+                    if (speedBuffer.length > 5) speedBuffer.shift();
+                    const avgSpeed = speedBuffer.reduce((a, b) => a + b, 0) / speedBuffer.length;
+                    
+                    // Per-map ETA
+                    let etaStr = '';
+                    if (avgSpeed > 0 && data.total > 0) {
+                        const etaSec = Math.round((data.total - data.downloaded) / avgSpeed);
+                        etaStr = etaSec < 60 ? ` · ETA ${etaSec}s` : ` · ETA ${Math.floor(etaSec / 60)}m`;
+                    }
+                    
+                    qItem.status = `[${data.mirror}] ${data.percent}%${etaStr}`;
                     qItem.percent = data.percent;
                     this.updateQueueItemDOM(id, qItem.status, qItem.percent);
                     
                     this.updateActCell(id, `<div class="prog-container"><div class="prog-fill" style="width:${data.percent}%"></div><div class="prog-text">${data.percent}%</div></div>`);
                     
-                    let mbps = (data.speed / (1024*1024)).toFixed(1);
-                    document.getElementById('batch-speed').textContent = `${mbps} MB/s`;
+                    // Global speed (sum across active downloads)
+                    this.activeSpeeds.set(id, avgSpeed);
+                    this._updateGlobalSpeed();
                     
-                    if (data.speed > 0) {
-                        let rem = (data.total - data.downloaded) / data.speed;
-                        document.getElementById('batch-eta').textContent = rem < 60 ? `${Math.round(rem)}s` : `${Math.floor(rem/60)}m`;
+                    if (avgSpeed > 0 && data.total > 0) {
+                        let rem = (data.total - data.downloaded) / avgSpeed;
+                        document.getElementById('batch-eta').textContent = rem < 60 ? `${Math.round(rem)}s` : `${Math.floor(rem / 60)}m`;
                     }
+                }
+                else if (data.type === 'skipped') {
+                    ev.close();
+                    qItem.status = 'skipped';
+                    this.updateQueueItemDOM(id, qItem.status, 0);
+                    this.updateActCell(id, `<span style="color:#e6a817;font-weight:bold;">Skipped</span>`);
+                    this.logConsole(`Map ${id} skipped.`, "warn");
+                    wrapResolve();
                 }
                 else if (data.type === 'done') {
                     ev.close();
@@ -1362,6 +1640,8 @@ class App {
                     
                     this.updateActCell(id, `<span style="color:#009900;font-weight:bold;">Done</span>`);
                     this.downloadedIds.add(id);
+                    // Reset mirror fail count on success
+                    if (data.mirror) this.mirrorFailCounts[data.mirror] = 0;
                     this.logConsole(`Successfully downloaded ${data.filename} to Songs folder.`, "ok");
                     wrapResolve();
                 }
@@ -1379,18 +1659,49 @@ class App {
             
             ev.onerror = () => {
                 ev.close();
-                qItem.status = 'failed';
                 const tr = document.getElementById(`row-${id}`);
-                this.updateQueueItemDOM(id, qItem.status, 0);
-                
-                this.updateActCell(id, `<span style="color:#990000;font-weight:bold;">Lost</span>`);
-                if(tr) tr.classList.add('failed');
-                this.failedIds.add(id);
-                this.logConsole(`Connection interrupted for map ${id}.`, "err");
+                // Fix: check if cancel was requested — show Cancelled, not Lost
+                if (this.cancelRequested) {
+                    qItem.status = 'cancelled';
+                    this.updateQueueItemDOM(id, qItem.status, 0);
+                    this.updateActCell(id, `<span style="color:#cc0000;font-weight:bold;">Cancelled</span>`);
+                } else {
+                    qItem.status = 'failed';
+                    this.updateQueueItemDOM(id, qItem.status, 0);
+                    this.updateActCell(id, `<span style="color:#990000;font-weight:bold;">Lost</span>`);
+                    if(tr) tr.classList.add('failed');
+                    this.failedIds.add(id);
+                    this.logConsole(`Connection interrupted for map ${id}.`, "err");
+                }
                 wrapResolve();
             };
         });
     }
+
+    _updateQueueMirrorErrors(id, errors) {
+        let container = document.getElementById(`q-errors-${id}`);
+        if (!container) {
+            const qItemEl = document.getElementById(`q-item-${id}`);
+            if (!qItemEl) return;
+            container = document.createElement('div');
+            container.className = 'queue-mirror-errors';
+            container.id = `q-errors-${id}`;
+            qItemEl.appendChild(container);
+        }
+        // Show last 3 errors
+        const recent = errors.slice(-3);
+        container.innerHTML = recent.map(e => `<div>↳ ${escapeHtml(e.mirror)}: ${escapeHtml(e.reason)}</div>`).join('');
+    }
+
+    _notifyMirrorDown(mirrorName) {
+        const msg = `${mirrorName} appears to be down (3 consecutive failures). Deprioritizing.`;
+        this.logConsole(msg, 'err');
+        this.showToast(msg, 'err');
+        if ('Notification' in window && Notification.permission === 'granted') {
+            new Notification('osu! Downloader — Mirror Down', { body: msg });
+        }
+    }
 }
 
 window.app = new App();
+

@@ -3,9 +3,12 @@ title OsuMapperDownloader Build
 cd /d "%~dp0"
 echo.
 echo ================================================
-echo   osu! Mapper Bulk Downloader - EXE Builder
+echo   osu! Map Bulk Downloader - EXE Builder
 echo ================================================
 echo.
+
+:: Kill running instance to prevent PermissionError
+taskkill /f /im OsuMapperDownloader.exe /t >nul 2>&1
 
 :: Check Python is available
 python --version >nul 2>&1

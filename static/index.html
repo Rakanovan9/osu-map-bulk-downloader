@@ -14,13 +14,24 @@
     </div>
 
     <div class="header-bar">
-        <h1>osu! Mapper Bulk Downloader</h1>
+        <h1>osu! Map Bulk Downloader<span id="header-version" style="font-size: 14px; font-weight: normal; margin-left: 10px; color: #ccc;"></span></h1>
         <p>Database and Download Utility</p>
         <div class="header-nav">
             <span id="songs-path-display" style="font-size:11px; color:#ccc; margin-right:10px;"></span>
             <a href="#" onclick="window.app.toggleDarkMode()">[ Toggle Dark Mode ]</a>
             &nbsp;&nbsp;
-            <a href="/setup?edit=true">[ Settings ]</a>
+            <a href="#" onclick="window.app.openSettingsModal(); return false;">[ Settings ]</a>
+        </div>
+    </div>
+
+    <!-- Settings Modal Overlay -->
+    <div id="settings-modal" class="modal-overlay">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span>System Settings</span>
+                <button class="modal-close-btn" onclick="window.app.closeSettingsModal()">X</button>
+            </div>
+            <iframe id="settings-iframe" class="modal-body" src=""></iframe>
         </div>
     </div>
 
@@ -222,22 +233,39 @@
             <div class="sidebar-header">Download Manager</div>
             
             <div class="sidebar-section">
-                <div><strong>Selected:</strong> <span id="selected-count">0</span> maps</div>
-                <button id="download-btn" onclick="window.app.startDownloadQueue()" style="font-weight:bold; width:100%; margin-top:5px;" disabled>Start Download Queue</button>
-                <button id="cancel-queue-btn" onclick="window.app.cancelQueue()" style="display:none; color:white; background-color:#cc0000; font-weight:bold; width:100%; margin-top:5px;">Cancel Queue</button>
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <div><strong>Selected:</strong> <span id="selected-count">0</span> maps</div>
+                    <button onclick="window.app.selectNone()" style="font-size:10px; padding:1px 6px;" title="Clear all selections">Clear All</button>
+                </div>
+            </div>
+
+            <div id="selected-list" class="selected-list">
+                <div class="selected-list-empty">No maps selected</div>
+            </div>
+
+            <div class="quick-add-row">
+                <input type="text" id="quick-add-input" placeholder="Paste ID or URL..." title="Enter a beatmapset ID or osu! URL to add to queue">
+                <button onclick="window.app.quickAddMap()" title="Add to selection">+ Add</button>
+            </div>
+            
+            <div class="sidebar-section">
+                <button id="download-btn" onclick="window.app.startDownloadQueue()" style="font-weight:bold; width:100%;" disabled>Start Queue (0)</button>
+                <button id="cancel-queue-btn" onclick="window.app.cancelQueue()" style="display:none; color:white; background-color:#cc0000; font-weight:bold; width:100%; margin-top:5px;">■ Cancel Queue</button>
                 <button id="retry-failed-btn" onclick="window.app.retryAllFailed()" style="display:none; color:#cc0000; font-weight:bold; width:100%; margin-top:5px;">Retry Failed Downloads</button>
-                <button id="open-folder-btn" onclick="window.app.openFolder()" style="width:100%; margin-top:5px;">Open Songs Folder</button>
-                <button onclick="window.app.refreshDownloadedStatus()" style="width:100%; margin-top:5px;" title="Re-check your Songs folder for newly downloaded maps">↻ Refresh Downloaded Status</button>
+                <div style="display:flex; gap:5px; margin-top:5px;">
+                    <button id="open-folder-btn" onclick="window.app.openFolder()" style="flex:1;">Open Songs Folder</button>
+                    <button onclick="window.app.refreshDownloadedStatus()" style="flex:1;" title="Re-check your Songs folder for newly downloaded maps">↻ Refresh</button>
+                </div>
             </div>
             
             <div id="batch-progress-panel" class="sidebar-section" style="display:none;">
                 <div style="font-weight:bold; margin-bottom:5px;">Batch Progress</div>
-                <div>Queue: <span id="batch-count">0/0</span></div>
-                <div>Speed: <span id="batch-speed">0 MB/s</span></div>
+                <div>Queue: <span id="batch-count">0/0</span> · Speed: <span id="batch-speed">0 MB/s</span></div>
                 <div>ETA: <span id="batch-eta">...</span></div>
                 <div class="prog-container" style="width:100%; margin-top:5px;">
                     <div class="prog-fill" id="batch-prog-fill"></div>
                 </div>
+                <button id="skip-btn" class="skip-btn" onclick="window.app.skipCurrent()" title="Skip the currently downloading map and move to the next">⏭ Skip Current</button>
             </div>
 
             <div class="sidebar-header" style="margin-top:10px;">Queue Activity</div>
@@ -245,6 +273,9 @@
                 <!-- Queue items injected here -->
                 <div style="color:#999; font-style:italic; padding:10px; text-align:center;">Queue is empty</div>
             </div>
+
+            <div class="version-badge" id="session-stats" style="margin-bottom: 2px;">Session: 0 maps (0 MB)</div>
+            <div class="version-badge" id="version-badge">v1.2.1 · osu! Map Bulk Downloader</div>
         </div>
     </div>
 

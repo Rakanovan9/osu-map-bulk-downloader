@@ -1,7 +1,10 @@
 """
-osu! Mapper Bulk Downloader — Flask Backend v3
+osu! Map Bulk Downloader — Flask Backend v1.2
 Now with: first-run setup wizard, config stored in %APPDATA%, PyInstaller-ready.
+v1.2: mirror health, parallel downloads, skip, custom mirrors.
 """
+
+APP_VERSION = "1.2.1"
 
 import os
 import re
@@ -35,7 +38,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
 OSU_API_BASE  = "https://osu.ppy.sh/api/v2"
 OSU_TOKEN_URL = "https://osu.ppy.sh/oauth/token"
 
-MIRRORS = [
+DEFAULT_MIRRORS = [
     {"name": "BeatConnect", "url": "https://beatconnect.io/b/{id}"},
     {"name": "Nekoha",      "url": "https://mirror.nekoha.moe/d/{id}"},
     {"name": "Sayobot",     "url": "https://dl.sayobot.cn/beatmaps/download/full/{id}"},
@@ -45,6 +48,58 @@ MIRRORS = [
 ]
 
 _ID_RE     = re.compile(r'^(\d+)')
+
+# ─── Mirror Health Scoring ───────────────────────────────────────────────────────
+# Lower score = preferred.  Incremented on failure, decremented on success (floor 0).
+_mirror_health: dict[str, int] = {}
+_mirror_speed: dict[str, float] = {}  # avg bytes per second
+_mirror_speed_samples: dict[str, int] = {}
+_mirror_health_lock = threading.Lock()
+_health_reset_interval = 3600  # seconds
+
+# ─── Session Stats ───────────────────────────────────────────────────────────────
+session_maps_downloaded = 0
+session_bytes_downloaded = 0
+session_stats_lock = threading.Lock()
+
+def _mirror_fail(name: str):
+    with _mirror_health_lock:
+        _mirror_health[name] = _mirror_health.get(name, 0) + 2
+
+def _mirror_success(name: str, speed_bps: float = 0):
+    with _mirror_health_lock:
+        current = _mirror_health.get(name, 0)
+        _mirror_health[name] = max(0, current - 1)
+        if speed_bps > 0:
+            samples = _mirror_speed_samples.get(name, 0)
+            avg = _mirror_speed.get(name, 0.0)
+            # Rolling average over last 5 samples
+            n = min(5, samples + 1)
+            _mirror_speed[name] = avg + (speed_bps - avg) / n
+            _mirror_speed_samples[name] = samples + 1
+
+def _get_sorted_mirrors() -> list[dict]:
+    """Return the current mirror list sorted by health score (best first)."""
+    cfg = load_config()
+    mirrors = cfg.get("mirrors", DEFAULT_MIRRORS)
+    with _mirror_health_lock:
+        return sorted(mirrors, key=lambda m: _mirror_health.get(m["name"], 0))
+
+def _start_health_reset_timer():
+    """Periodically decay all mirror health scores toward zero."""
+    def _reset():
+        with _mirror_health_lock:
+            for name in list(_mirror_health):
+                _mirror_health[name] = max(0, _mirror_health[name] - 1)
+        _start_health_reset_timer()
+    t = threading.Timer(_health_reset_interval, _reset)
+    t.daemon = True
+    t.start()
+
+_start_health_reset_timer()
+
+# ─── Skip Flags ──────────────────────────────────────────────────────────────────
+_skip_flags: set[int] = set()
 
 
 class _DataBlob(ctypes.Structure):
@@ -110,7 +165,8 @@ def load_config() -> dict:
             return data
         except Exception:
             pass
-    return {"client_id": "", "client_secret": "", "songs_path": default_songs_path()}
+    return {"client_id": "", "client_secret": "", "songs_path": default_songs_path(),
+            "mirrors": DEFAULT_MIRRORS, "max_parallel": 2, "download_delay_ms": 500}
 
 
 def save_config(data: dict):
@@ -301,9 +357,16 @@ def index():
 @app.route('/api/config')
 def get_config_route():
     cfg = load_config()
+    mirrors = cfg.get('mirrors', DEFAULT_MIRRORS)
+    with _mirror_health_lock:
+        mirror_info = [{"name": m["name"], "url": m["url"],
+                        "health": _mirror_health.get(m["name"], 0)} for m in mirrors]
     return jsonify({
-        "songs_path": cfg.get('songs_path', ''),
-        "mirrors":    [m["name"] for m in MIRRORS],
+        "songs_path":       cfg.get('songs_path', ''),
+        "mirrors":          mirror_info,
+        "max_parallel":     cfg.get('max_parallel', 2),
+        "download_delay_ms": cfg.get('download_delay_ms', 500),
+        "version":          APP_VERSION,
     })
 
 
@@ -527,81 +590,123 @@ def download_with_progress(beatmapset_id):
         errors = []
         final_path = songs_path / f"{beatmapset_id}.osz"
         part_path = songs_path / f".{beatmapset_id}.{secrets.token_hex(8)}.osz.part"
+        completed = False  # track whether os.replace succeeded
 
-        with _get_download_lock(beatmapset_id):
-            if final_path.exists():
-                yield _sse({"type": "done", "mirror": "local cache", "filename": final_path.name,
-                            "size": final_path.stat().st_size, "path": str(final_path)})
-                return
-            for mirror in MIRRORS:
-                url = mirror["url"].format(id=beatmapset_id)
-                yield _sse({"type": "trying", "mirror": mirror["name"]})
-                try:
-                    with _http.get(url, stream=True, timeout=(15, 120), allow_redirects=True) as resp:
-                        if not resp.ok:
-                            reason = _classify_error(resp=resp)
-                            errors.append({"mirror": mirror["name"], "reason": reason})
-                            yield _sse({"type": "mirror_fail", "mirror": mirror["name"], "reason": reason})
-                            continue
-                        content_type = resp.headers.get("Content-Type", "").lower()
-                        if "text/html" in content_type or "application/json" in content_type:
-                            raise ValueError("Mirror returned a non-map response")
-                        try:
-                            total_size = int(resp.headers.get("Content-Length", 0))
-                        except ValueError:
-                            total_size = 0
-                        downloaded = 0
-                        yield _sse({"type": "start", "mirror": mirror["name"], "total": total_size, "filename": final_path.name})
-                        speed_bytes = 0
-                        last_time = time.time()
-                        last_bytes = 0
-                        with open(part_path, "wb") as f:
-                            for chunk in resp.iter_content(chunk_size=32768):
-                                if chunk:
-                                    f.write(chunk)
-                                    downloaded += len(chunk)
-                                    now     = time.time()
-                                    elapsed = now - last_time
-                                    if elapsed >= 0.4:
-                                        speed_bytes = int((downloaded - last_bytes) / elapsed)
-                                        last_time   = now
-                                        last_bytes  = downloaded
-                                        pct = round(downloaded / total_size * 100, 1) if total_size else 0
-                                        yield _sse({"type": "progress", "downloaded": downloaded,
-                                                    "total": total_size, "percent": pct, "speed": speed_bytes})
-                        if total_size and downloaded != total_size:
-                            raise ValueError("Download ended before the advertised content length")
-                        if downloaded < 1024:
-                            raise ValueError("Downloaded file is too small to be a beatmap archive")
-                    os.replace(part_path, final_path)
-                    with _download_index_lock:
-                        _download_index["loaded_at"] = 0
-                    yield _sse({"type": "done", "mirror": mirror["name"], "filename": final_path.name,
-                                "size": downloaded, "path": str(final_path).replace("\\", "/")})
-                
-                    # Append to history only after the final file exists.
-                    try:
-                        import datetime
-                        os.makedirs(CONFIG_DIR, exist_ok=True)
-                        log_path = os.path.join(CONFIG_DIR, 'download_history.txt')
-                        with open(log_path, 'a', encoding='utf-8') as hf:
-                            ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            hf.write(f"[{ts}] ID: {beatmapset_id} | Mirror: {mirror['name']} | File: {final_path.name}\n")
-                    except OSError:
-                        pass
+        try:
+            with _get_download_lock(beatmapset_id):
+                if final_path.exists():
+                    yield _sse({"type": "done", "mirror": "local cache", "filename": final_path.name,
+                                "size": final_path.stat().st_size, "path": str(final_path)})
+                    completed = True
                     return
 
-                except Exception as e:
-                    try:
-                        part_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    reason = _classify_error(e)
-                    errors.append({"mirror": mirror["name"], "reason": reason})
-                    yield _sse({"type": "mirror_fail", "mirror": mirror["name"], "reason": reason})
-                    continue
+                # Clear any stale skip flag
+                _skip_flags.discard(beatmapset_id)
 
-        yield _sse({"type": "failed", "message": "All mirrors failed", "errors": errors})
+                for mirror in _get_sorted_mirrors():
+                    # Check skip flag before each mirror attempt
+                    if beatmapset_id in _skip_flags:
+                        _skip_flags.discard(beatmapset_id)
+                        yield _sse({"type": "skipped", "mirror": mirror["name"]})
+                        return
+
+                    url = mirror["url"].format(id=beatmapset_id)
+                    yield _sse({"type": "trying", "mirror": mirror["name"]})
+                    try:
+                        with _http.get(url, stream=True, timeout=(15, 120), allow_redirects=True) as resp:
+                            if not resp.ok:
+                                reason = _classify_error(resp=resp)
+                                errors.append({"mirror": mirror["name"], "reason": reason})
+                                _mirror_fail(mirror["name"])
+                                yield _sse({"type": "mirror_fail", "mirror": mirror["name"], "reason": reason})
+                                continue
+                            content_type = resp.headers.get("Content-Type", "").lower()
+                            if "text/html" in content_type or "application/json" in content_type:
+                                raise ValueError("Mirror returned a non-map response")
+                            try:
+                                total_size = int(resp.headers.get("Content-Length", 0))
+                            except ValueError:
+                                total_size = 0
+                            downloaded = 0
+                            yield _sse({"type": "start", "mirror": mirror["name"], "total": total_size, "filename": final_path.name})
+                            speed_bytes = 0
+                            start_time = time.time()
+                            last_time = start_time
+                            last_bytes = 0
+                            with open(part_path, "wb") as f:
+                                for chunk in resp.iter_content(chunk_size=262144):
+                                    # Check skip flag during chunk download
+                                    if beatmapset_id in _skip_flags:
+                                        _skip_flags.discard(beatmapset_id)
+                                        yield _sse({"type": "skipped", "mirror": mirror["name"]})
+                                        return
+                                    if chunk:
+                                        f.write(chunk)
+                                        downloaded += len(chunk)
+                                        now     = time.time()
+                                        elapsed = now - last_time
+                                        if elapsed >= 0.4:
+                                            speed_bytes = int((downloaded - last_bytes) / elapsed)
+                                            last_time   = now
+                                            last_bytes  = downloaded
+                                            pct = round(downloaded / total_size * 100, 1) if total_size else 0
+                                            yield _sse({"type": "progress", "mirror": mirror["name"], 
+                                                        "downloaded": downloaded, "total": total_size, 
+                                                        "percent": pct, "speed": speed_bytes})
+                            if total_size and downloaded != total_size:
+                                raise ValueError("Download ended before the advertised content length")
+                            if downloaded < 1024:
+                                raise ValueError("Downloaded file is too small to be a beatmap archive")
+                        
+                        os.replace(part_path, final_path)
+                        completed = True
+                        
+                        # Calculate final average speed for the mirror
+                        total_elapsed = time.time() - start_time
+                        avg_speed = downloaded / total_elapsed if total_elapsed > 0 else 0
+                        _mirror_success(mirror["name"], avg_speed)
+                        
+                        global session_maps_downloaded, session_bytes_downloaded
+                        with session_stats_lock:
+                            session_maps_downloaded += 1
+                            session_bytes_downloaded += downloaded
+                            
+                        with _download_index_lock:
+                            _download_index["loaded_at"] = 0
+                        yield _sse({"type": "done", "mirror": mirror["name"], "filename": final_path.name,
+                                    "size": downloaded, "path": str(final_path).replace("\\", "/")})
+
+                        # Append to history only after the final file exists.
+                        try:
+                            import datetime
+                            os.makedirs(CONFIG_DIR, exist_ok=True)
+                            log_path = os.path.join(CONFIG_DIR, 'download_history.txt')
+                            with open(log_path, 'a', encoding='utf-8') as hf:
+                                ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                hf.write(f"[{ts}] ID: {beatmapset_id} | Mirror: {mirror['name']} | File: {final_path.name}\n")
+                        except OSError:
+                            pass
+                        return
+
+                    except Exception as e:
+                        try:
+                            part_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        reason = _classify_error(e)
+                        _mirror_fail(mirror["name"])
+                        errors.append({"mirror": mirror["name"], "reason": reason})
+                        yield _sse({"type": "mirror_fail", "mirror": mirror["name"], "reason": reason})
+                        continue
+
+            yield _sse({"type": "failed", "message": "All mirrors failed", "errors": errors})
+        finally:
+            # Clean up partial file if download was not completed
+            if not completed:
+                try:
+                    part_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     return Response(stream_with_context(generate()), content_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -662,9 +767,114 @@ def get_history_json():
     return jsonify({"history": history})
 
 
+# ─── Skip Endpoint ───────────────────────────────────────────────────────────────
+
+@app.route('/api/skip/<int:beatmapset_id>', methods=['POST'])
+def skip_download(beatmapset_id):
+    """Signal the download generator for this map to abort gracefully."""
+    _skip_flags.add(beatmapset_id)
+    return jsonify({"ok": True})
+
+
+# ─── Stats Endpoint ────────────────────────────────────────────────────────────────
+
+@app.route('/api/stats')
+def get_stats():
+    """Return session statistics."""
+    with session_stats_lock:
+        return jsonify({
+            "maps": session_maps_downloaded,
+            "bytes": session_bytes_downloaded
+        })
+
+# ─── Mirror Management Endpoints ─────────────────────────────────────────────────
+
+@app.route('/api/mirrors')
+def get_mirrors():
+    """Return the current mirror list with health scores and speeds."""
+    cfg = load_config()
+    mirrors = cfg.get('mirrors', DEFAULT_MIRRORS)
+    with _mirror_health_lock:
+        result = [{"name": m["name"], "url": m["url"],
+                   "health": _mirror_health.get(m["name"], 0),
+                   "speed": _mirror_speed.get(m["name"], 0.0)} for m in mirrors]
+    return jsonify({"mirrors": result})
+
+
+@app.route('/api/mirrors', methods=['POST'])
+def add_mirror():
+    """Add a custom mirror.  Body: {"name": "...", "url": ".../{id}..."}."""
+    data = request.get_json(silent=True) or {}
+    name = data.get('name', '').strip()
+    url  = data.get('url', '').strip()
+    if not name or not url:
+        return jsonify({"ok": False, "error": "Name and URL are required."}), 400
+    if '{id}' not in url:
+        return jsonify({"ok": False, "error": "URL must contain {id} placeholder."}), 400
+    cfg = load_config()
+    mirrors = list(cfg.get('mirrors', DEFAULT_MIRRORS))
+    if any(m['name'] == name for m in mirrors):
+        return jsonify({"ok": False, "error": f"Mirror '{name}' already exists."}), 409
+    mirrors.append({"name": name, "url": url})
+    cfg['mirrors'] = mirrors
+    save_config(cfg)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/mirrors/<name>', methods=['DELETE'])
+def delete_mirror(name):
+    """Remove a mirror by name."""
+    cfg = load_config()
+    mirrors = list(cfg.get('mirrors', DEFAULT_MIRRORS))
+    new_mirrors = [m for m in mirrors if m['name'] != name]
+    if len(new_mirrors) == len(mirrors):
+        return jsonify({"ok": False, "error": "Mirror not found."}), 404
+    if len(new_mirrors) == 0:
+        return jsonify({"ok": False, "error": "Cannot delete all mirrors."}), 400
+    cfg['mirrors'] = new_mirrors
+    save_config(cfg)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/mirrors/reorder', methods=['POST'])
+def reorder_mirrors():
+    """Set the base mirror order.  Body: {"order": ["name1", "name2", ...]}."""
+    data = request.get_json(silent=True) or {}
+    order = data.get('order', [])
+    if not isinstance(order, list) or len(order) == 0:
+        return jsonify({"ok": False, "error": "Order list is required."}), 400
+    cfg = load_config()
+    mirrors = cfg.get('mirrors', DEFAULT_MIRRORS)
+    by_name = {m['name']: m for m in mirrors}
+    reordered = []
+    for name in order:
+        if name in by_name:
+            reordered.append(by_name.pop(name))
+    # Append any mirrors not mentioned in the order list
+    reordered.extend(by_name.values())
+    cfg['mirrors'] = reordered
+    save_config(cfg)
+    return jsonify({"ok": True})
+
+
+# ─── Settings Endpoints ──────────────────────────────────────────────────────────
+
+@app.route('/api/settings', methods=['POST'])
+def update_settings():
+    """Update download-manager settings (max_parallel, download_delay_ms)."""
+    data = request.get_json(silent=True) or {}
+    cfg = load_config()
+    if 'max_parallel' in data:
+        cfg['max_parallel'] = max(1, min(5, int(data['max_parallel'])))
+    if 'download_delay_ms' in data:
+        cfg['download_delay_ms'] = max(0, min(5000, int(data['download_delay_ms'])))
+    save_config(cfg)
+    return jsonify({"ok": True})
+
+
 # ─── Entry Point ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("[*] osu! Mapper Bulk Downloader v3")
+    print(f"[*] osu! Map Bulk Downloader {APP_VERSION}")
     print(f"[>] Config: {CONFIG_FILE}")
     try:
         import webview

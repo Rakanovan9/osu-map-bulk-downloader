@@ -23,13 +23,19 @@
     </style>
 </head>
 <body>
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('modal') === 'true') {
+            document.write('<style>.header-bar { display: none !important; } .main-layout { margin-top: 0 !important; }</style>');
+        }
+    </script>
     <div class="header-bar">
-        <h1>osu! Mapper Bulk Downloader</h1>
+        <h1>osu! Map Bulk Downloader</h1>
         <p>System Configuration Utility</p>
         <div class="header-nav">
             <a href="#" onclick="toggleDarkMode(); return false;">[ Toggle Dark Mode ]</a>
             &nbsp;&nbsp;
-            <a href="/">[ Back to Main Page ]</a>
+            <a href="#" onclick="if(urlParams.get('modal')==='true'){ window.parent.app.closeSettingsModal(); } else { window.location.href='/'; }; return false;">[ Back to Main Page ]</a>
         </div>
     </div>
 
@@ -90,8 +96,71 @@
         </fieldset>
 
         <div style="text-align: right; padding-right: 15px;">
-            <button id="saveBtn" onclick="saveAndFinish()" disabled style="font-weight: bold; padding: 5px 15px;">Save Configuration & Launch</button>
+            <button id="saveBtn" onclick="saveAndFinish()" disabled style="font-weight: bold; padding: 5px 15px;">Save Configuration &amp; Launch</button>
         </div>
+
+        <hr style="margin: 20px 0;">
+        <h2 style="margin-top: 0;">Download Settings</h2>
+
+        <fieldset style="margin-bottom: 10px; padding: 10px;">
+            <legend>Parallel Downloads</legend>
+            <table cellpadding="2">
+                <tr>
+                    <td align="right" width="150"><label for="maxParallel">Concurrent Slots:</label></td>
+                    <td>
+                        <input type="number" id="maxParallel" min="1" max="5" value="2" style="width:50px;">
+                        <span style="font-size:11px; color:#666;"> (1 = sequential, max 5)</span>
+                    </td>
+                </tr>
+                <tr>
+                    <td align="right"><label for="downloadDelay">Inter-download Delay:</label></td>
+                    <td>
+                        <input type="range" id="downloadDelay" min="0" max="2000" step="100" value="500" oninput="document.getElementById('delayValue').textContent = this.value + 'ms'" style="width:150px; vertical-align:middle;">
+                        <span id="delayValue" style="font-size:11px; color:#666;">500ms</span>
+                    </td>
+                </tr>
+                <tr>
+                    <td></td>
+                    <td style="padding-top:5px;">
+                        <button onclick="saveDownloadSettings()">Save Download Settings</button>
+                        <div id="dlSettingsStatus" class="status-box"></div>
+                    </td>
+                </tr>
+            </table>
+        </fieldset>
+
+        <fieldset style="margin-bottom: 10px; padding: 10px;">
+            <legend>Mirror Manager</legend>
+            <p style="font-size:11px; color:#666; margin-top:0;">Mirrors are tried in order. Health score reflects recent success/failure (lower is better). Drag rows to reorder.</p>
+            <table class="data-table" id="mirror-table" style="margin-bottom:10px;">
+                <thead>
+                    <tr>
+                        <th width="20"></th>
+                        <th width="15"></th>
+                        <th>Name</th>
+                        <th>Speed</th>
+                        <th>URL Pattern</th>
+                        <th width="60">Action</th>
+                    </tr>
+                </thead>
+                <tbody id="mirror-tbody">
+                    <tr><td colspan="6">Loading mirrors...</td></tr>
+                </tbody>
+            </table>
+            <div style="border: 1px dashed #999; padding: 8px; background: #fafafa;" class="info-box">
+                <strong>Add Custom Mirror</strong><br>
+                <table cellpadding="2">
+                    <tr>
+                        <td><label for="newMirrorName">Name:</label></td>
+                        <td><input type="text" id="newMirrorName" size="15" placeholder="e.g. MyMirror"></td>
+                        <td><label for="newMirrorUrl" style="margin-left:8px;">URL:</label></td>
+                        <td><input type="text" id="newMirrorUrl" size="35" placeholder="https://example.com/d/{id}"></td>
+                        <td><button onclick="addMirror()">+ Add</button></td>
+                    </tr>
+                </table>
+                <div id="mirrorAddStatus" class="status-box"></div>
+            </div>
+        </fieldset>
         </div>
     </div>
 
@@ -210,7 +279,11 @@
                 });
                 const data = await resp.json();
                 if (data.ok) {
-                    window.location.href = '/';
+                    if (urlParams.get('modal') === 'true') {
+                        window.parent.app.closeSettingsModal();
+                    } else {
+                        window.location.href = '/';
+                    }
                 } else {
                     alert(`Error: ${data.error}`);
                     btn.disabled = false;
@@ -230,7 +303,141 @@
             el.textContent = msg;
         }
 
+        // ─── Download Settings ──────────────────────────────────────────────
+        async function saveDownloadSettings() {
+            const maxParallel = parseInt(document.getElementById('maxParallel').value) || 2;
+            const downloadDelay = parseInt(document.getElementById('downloadDelay').value) || 500;
+            try {
+                const resp = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ max_parallel: maxParallel, download_delay_ms: downloadDelay })
+                });
+                const data = await resp.json();
+                if (data.ok) {
+                    setStatus('dlSettingsStatus', 'ok', 'Download settings saved.');
+                } else {
+                    setStatus('dlSettingsStatus', 'err', `Error: ${data.error}`);
+                }
+            } catch {
+                setStatus('dlSettingsStatus', 'err', 'Network error.');
+            }
+        }
+
+        // ─── Mirror Manager ─────────────────────────────────────────────────
+        let currentMirrors = [];
+
+        async function loadMirrors() {
+            try {
+                const data = await fetch('/api/mirrors').then(r => r.json());
+                currentMirrors = data.mirrors || [];
+                renderMirrorTable();
+            } catch {
+                document.getElementById('mirror-tbody').innerHTML = '<tr><td colspan="5">Failed to load mirrors.</td></tr>';
+            }
+        }
+
+        function renderMirrorTable() {
+            const tbody = document.getElementById('mirror-tbody');
+            tbody.innerHTML = '';
+            currentMirrors.forEach((m, i) => {
+                const tr = document.createElement('tr');
+                tr.draggable = true;
+                tr.dataset.index = i;
+                tr.style.cursor = 'grab';
+
+                tr.addEventListener('dragstart', (e) => {
+                    e.dataTransfer.setData('text/plain', i);
+                    tr.style.opacity = '0.5';
+                });
+                tr.addEventListener('dragend', () => { tr.style.opacity = '1'; });
+                tr.addEventListener('dragover', (e) => { e.preventDefault(); tr.style.borderTop = '2px solid #0066cc'; });
+                tr.addEventListener('dragleave', () => { tr.style.borderTop = ''; });
+                tr.addEventListener('drop', async (e) => {
+                    e.preventDefault();
+                    tr.style.borderTop = '';
+                    const fromIdx = parseInt(e.dataTransfer.getData('text/plain'));
+                    const toIdx = i;
+                    if (fromIdx === toIdx) return;
+                    const item = currentMirrors.splice(fromIdx, 1)[0];
+                    currentMirrors.splice(toIdx, 0, item);
+                    renderMirrorTable();
+                    // Save new order
+                    await fetch('/api/mirrors/reorder', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ order: currentMirrors.map(m => m.name) })
+                    });
+                });
+
+                const healthClass = m.health === 0 ? 'healthy' : m.health <= 3 ? 'degraded' : 'unhealthy';
+                const mbps = m.speed ? (m.speed / (1024 * 1024)).toFixed(1) + ' MB/s' : '-';
+
+                tr.innerHTML = `
+                    <td style="cursor:grab;">☰</td>
+                    <td><span class="mirror-health-dot ${healthClass}" title="Health score: ${m.health}"></span></td>
+                    <td>${m.name}</td>
+                    <td style="font-size:11px; color:#555;">${mbps}</td>
+                    <td style="font-size:10px; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${m.url}">${m.url}</td>
+                    <td><button onclick="deleteMirror('${m.name}')" style="color:red; font-size:10px;">Remove</button></td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function addMirror() {
+            const name = document.getElementById('newMirrorName').value.trim();
+            const url = document.getElementById('newMirrorUrl').value.trim();
+            if (!name || !url) { setStatus('mirrorAddStatus', 'err', 'Name and URL required.'); return; }
+            if (!url.includes('{id}')) { setStatus('mirrorAddStatus', 'err', 'URL must contain {id} placeholder.'); return; }
+            try {
+                const resp = await fetch('/api/mirrors', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name, url })
+                });
+                const data = await resp.json();
+                if (data.ok) {
+                    setStatus('mirrorAddStatus', 'ok', `Mirror '${name}' added.`);
+                    document.getElementById('newMirrorName').value = '';
+                    document.getElementById('newMirrorUrl').value = '';
+                    loadMirrors();
+                } else {
+                    setStatus('mirrorAddStatus', 'err', data.error);
+                }
+            } catch {
+                setStatus('mirrorAddStatus', 'err', 'Network error.');
+            }
+        }
+
+        async function deleteMirror(name) {
+            if (!confirm(`Remove mirror "${name}"?`)) return;
+            try {
+                const resp = await fetch(`/api/mirrors/${encodeURIComponent(name)}`, { method: 'DELETE' });
+                const data = await resp.json();
+                if (data.ok) {
+                    loadMirrors();
+                } else {
+                    alert(data.error);
+                }
+            } catch {
+                alert('Network error.');
+            }
+        }
+
+        // ─── Init ───────────────────────────────────────────────────────────
+        async function loadExistingSettings() {
+            try {
+                const data = await fetch('/api/config').then(r => r.json());
+                document.getElementById('maxParallel').value = data.max_parallel || 2;
+                document.getElementById('downloadDelay').value = data.download_delay_ms || 500;
+                document.getElementById('delayValue').textContent = (data.download_delay_ms || 500) + 'ms';
+            } catch {}
+        }
+
         loadExisting();
+        loadExistingSettings();
+        loadMirrors();
     </script>
 </body>
 </html>
